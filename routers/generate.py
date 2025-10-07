@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from db.database import get_db
 from models import FirstName, LastName
-from schemas.generate import GenerateRequest, GenerateResponse
+from schemas.generate import GenerateRequest, GenerateResponse, FieldItem
 from typing import List, Dict, Any
 import random, io, csv, secrets, re
 
@@ -30,20 +30,22 @@ def sql_escape(value: Any) -> str:
     s = str(value)
     return "'" + s.replace("'", "''") + "'"
 
-def build_create_table_sql(table_name: str, fields: List[str]) -> str:
+def build_create_table_sql(table_name: str, fields: List[FieldItem]) -> str:
     cols = ["id SERIAL PRIMARY KEY"]
     for f in fields:
-        if f in SQL_TYPES:
-            cols.append(f"{f} {SQL_TYPES[f]}")
+        if not f.type or not f.name:
+            continue
+        sql_type = SQL_TYPES.get(f.type.lower(), "TEXT")
+        cols.append(f"{f.name} {sql_type}")
     cols_sql = ", ".join(cols)
-    return f"CREATE TABLE {table_name} ({cols_sql});"
+    return f"CREATE TABLE IF NOT EXISTS {table_name} ({cols_sql});"
 
 @router.post("/", tags=["generate"])
 def generate_data(request: GenerateRequest, db: Session = Depends(get_db)):
 
     for f in request.fields:
-        if f not in ALL_FIELDS:
-            raise HTTPException(status_code=400, detail=f"Field '{f}' is not valid")
+        if f.type not in ALL_FIELDS:
+            raise HTTPException(status_code=400, detail=f"Field '{f.type}' is not valid")
 
     if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', request.table_name):
         raise HTTPException(status_code=400, detail="Invalid table_name")
@@ -61,22 +63,22 @@ def generate_data(request: GenerateRequest, db: Session = Depends(get_db)):
         row: Dict[str, Any] = {}
         row["id"] = i
         for field in request.fields:
-            if field == "firstname":
-                row["firstname"] = fn.name
-            elif field == "lastname":
-                row["lastname"] = ln.name
-            elif field == "email":
-                row["email"] = fn.email
-            elif field == "username":
-                row["username"] = fn.username
-            elif field == "gender":
-                row["gender"] = fn.gender.value
-            elif field == "password":
+            if field.type == "firstname":
+                row[field.name] = fn.name
+            elif field.type == "lastname":
+                row[field.name] = ln.name
+            elif field.type == "email":
+                row[field.name] = fn.email
+            elif field.type == "username":
+                row[field.name] = fn.username
+            elif field.type == "gender":
+                row[field.name] = fn.gender.value
+            elif field.type == "password":
                 plaintext = secrets.token_hex(12)
                 plaintext_bytes = plaintext.encode("utf-8")[:72]
                 plaintext = plaintext_bytes.decode("utf-8", errors="ignore")
                 hashed = pwd_context.hash(plaintext)
-                row["password"] = hashed
+                row[field.name] = hashed
         rows.append(row)
 
     ddl = None
@@ -92,7 +94,7 @@ def generate_data(request: GenerateRequest, db: Session = Depends(get_db)):
         parts = []
         if ddl:
             parts.append(ddl)
-        cols = ["id"] + request.fields
+        cols = ["id"] + [f.name for f in request.fields]
         cols_str = ", ".join(cols)
         values_list = []
         for r in rows:
@@ -108,7 +110,7 @@ def generate_data(request: GenerateRequest, db: Session = Depends(get_db)):
     if fmt == "csv":
         output = io.StringIO()
         writer = csv.writer(output)
-        header = ["id"] + request.fields
+        header = ["id"] + [f.name for f in request.fields]
         writer.writerow(header)
         for r in rows:
             row_vals = [r.get(col, "") for col in header]
@@ -124,7 +126,7 @@ def generate_data(request: GenerateRequest, db: Session = Depends(get_db)):
         except ImportError:
             raise HTTPException(status_code=500, detail="pandas is required for excel output. pip install pandas openpyxl")
         df = pd.DataFrame(rows)
-        cols = ["id"] + request.fields
+        cols = ["id"] + [f.name for f in request.fields]
         df = df.reindex(columns=cols)
         bio = io.BytesIO()
         df.to_excel(bio, index=False, engine="openpyxl")
