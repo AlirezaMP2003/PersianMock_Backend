@@ -1,17 +1,15 @@
-import csv
-import io
+
 import random
 import secrets
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Response
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session, joinedload
 
 from db.database import get_db
 from models import FirstName, LastName, Car, City
-from schemas.generate import GenerateRequest, GenerateResponse
+from schemas.generate import GenerateRequest
 
 from generators.iranian import (
     generate_car_color,
@@ -19,6 +17,15 @@ from generators.iranian import (
     generate_mobile_number,
     generate_postal_code,
 )
+
+from exporters.common import get_columns
+from exporters.json_exporter import export_json
+from exporters.csv_exporter import export_csv
+from exporters.sql_exporter import (
+    build_create_table_sql,
+    export_sql,
+)
+from exporters.excel_exporter import export_excel
 
 
 router = APIRouter()
@@ -29,47 +36,13 @@ pwd_context = CryptContext(
 )
 
 
-SQL_TYPES = {
-    "firstname": "VARCHAR(100)",
-    "lastname": "VARCHAR(100)",
-    "email": "VARCHAR(255)",
-    "username": "VARCHAR(255)",
-    "gender": "VARCHAR(10)",
-    "password": "VARCHAR(1000)",
-    "province": "VARCHAR(100)",
-    "city": "VARCHAR(100)",
-    "car_company": "VARCHAR(100)",
-    "car_name": "VARCHAR(100)",
-    "car_color": "VARCHAR(100)",
-    "car_year": "INTEGER",
-    "mobile_number": "VARCHAR(11)",
-    "postal_code": "VARCHAR(10)",
-}
-
-
-def quote_identifier(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
-
-
-def sql_literal(value: Any) -> str:
-    if value is None:
-        return "NULL"
-
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-
-    if isinstance(value, (int, float)):
-        return str(value)
-
-    return "'" + str(value).replace("'", "''") + "'"
-
-
 def unique_with_suffix(
     value: str,
     seen: set[str],
     *,
     email: bool = False,
 ) -> str:
+
     if value not in seen:
         seen.add(value)
         return value
@@ -94,41 +67,6 @@ def unique_with_suffix(
         suffix += 1
 
 
-def build_create_table_sql(table_name, fields):
-    columns = ['"id" INTEGER PRIMARY KEY']
-
-    for field in fields:
-        if field.type == "id":
-            continue
-
-        sql_type = SQL_TYPES[field.type]
-        column_name = quote_identifier(field.name)
-
-        columns.append(
-            f"{column_name} {sql_type}"
-        )
-
-    columns_sql = ", ".join(columns)
-
-    return (
-        f"CREATE TABLE IF NOT EXISTS "
-        f"{quote_identifier(table_name)} "
-        f"({columns_sql});"
-    )
-
-
-def spreadsheet_safe(value: Any) -> Any:
-    if (
-        isinstance(value, str)
-        and value.lstrip().startswith(
-            ("=", "+", "-", "@")
-        )
-    ):
-        return "'" + value
-
-    return value
-
-
 @router.post("/", tags=["generate"])
 def generate_data(
     request: GenerateRequest,
@@ -145,7 +83,7 @@ def generate_data(
         for field in fields
     }
 
-    # Determine which reference tables are needed.
+    # Determine the required reference tables.
 
     needs_firstname = bool(
         requested_types
@@ -157,17 +95,21 @@ def generate_data(
         }
     )
 
-    needs_lastname = "lastname" in requested_types
+    needs_lastname = (
+        "lastname" in requested_types
+    )
 
     needs_location = bool(
-        requested_types & {"province", "city"}
+        requested_types
+        & {"province", "city"}
     )
 
     needs_car = bool(
-        requested_types & {"car_company", "car_name"}
+        requested_types
+        & {"car_company", "car_name"}
     )
 
-    # Load only the required reference data.
+    # Load only required reference datasets.
 
     first_names = (
         db.query(FirstName).all()
@@ -195,7 +137,7 @@ def generate_data(
         else []
     )
 
-    # Check that the required tables have data.
+    # Validate reference data availability.
 
     if needs_firstname and not first_names:
         raise HTTPException(
@@ -226,7 +168,7 @@ def generate_data(
 
     rows: list[dict[str, Any]] = []
 
-    # Generate synthetic records.
+    # Generate records.
 
     for i in range(1, request.count + 1):
 
@@ -242,17 +184,11 @@ def generate_data(
             else None
         )
 
-        # A city and its province come from
-        # the same reference relationship.
-
         city = (
             random.choice(cities)
             if needs_location
             else None
         )
-
-        # Company and model come from
-        # the same car record.
 
         car = (
             random.choice(cars)
@@ -263,6 +199,8 @@ def generate_data(
         values: dict[str, Any] = {
             "id": i,
         }
+
+        # Personal fields
 
         if first is not None:
             values["firstname"] = first.name
@@ -284,21 +222,26 @@ def generate_data(
         if last is not None:
             values["lastname"] = last.name
 
+        # Geographic fields
+
         if city is not None:
             values["city"] = city.name
             values["province"] = city.province.name
 
+        # Vehicle fields
+
         if car is not None:
             values["car_company"] = car.company
             values["car_name"] = car.name
+
+        # Password
 
         if "password" in requested_types:
             values["password"] = pwd_context.hash(
                 secrets.token_hex(12)
             )
 
-        
-        # Generate algorithmic Iranian data.
+        # Algorithmic fields
 
         if "car_color" in requested_types:
             values["car_color"] = generate_car_color()
@@ -312,6 +255,7 @@ def generate_data(
         if "postal_code" in requested_types:
             values["postal_code"] = generate_postal_code()
 
+        # Map field types to custom column names.
 
         row: dict[str, Any] = {
             "id": i,
@@ -322,7 +266,7 @@ def generate_data(
 
         rows.append(row)
 
-    # Build optional CREATE TABLE statement.
+    # Optional SQL DDL.
 
     ddl = None
 
@@ -332,138 +276,36 @@ def generate_data(
             fields,
         )
 
-    columns = ["id"] + [
-        field.name
-        for field in fields
-    ]
-
-    # JSON output.
+    # Dispatch to the appropriate exporter.
 
     if request.format == "json":
-        return GenerateResponse(
-            data=rows,
+        return export_json(
+            rows=rows,
             ddl=ddl,
-            format="json",
-        ).model_dump()
-
-    # SQL output.
+        )
 
     if request.format == "sql":
-
-        sql_rows = []
-
-        for row in rows:
-            values_sql = ", ".join(
-                sql_literal(row[column])
-                for column in columns
-            )
-
-            sql_rows.append(
-                f"({values_sql})"
-            )
-
-        columns_sql = ", ".join(
-            quote_identifier(column)
-            for column in columns
+        return export_sql(
+            rows=rows,
+            table_name=request.table_name,
+            fields=fields,
+            ddl=ddl,
         )
 
-        insert_sql = (
-            f"INSERT INTO "
-            f"{quote_identifier(request.table_name)} "
-            f"({columns_sql}) VALUES\n"
-            + ",\n".join(sql_rows)
-            + ";"
-        )
-
-        sql_text = "\n\n".join(
-            part
-            for part in [ddl, insert_sql]
-            if part
-        )
-
-        return Response(
-            content=sql_text,
-            media_type="text/plain; charset=utf-8",
-        )
-
-    # CSV output.
+    columns = get_columns(fields)
 
     if request.format == "csv":
-
-        output = io.StringIO(newline="")
-        writer = csv.writer(output)
-
-        writer.writerow(columns)
-
-        for row in rows:
-            writer.writerow([
-                spreadsheet_safe(row[column])
-                for column in columns
-            ])
-
-        csv_bytes = output.getvalue().encode(
-            "utf-8-sig"
+        return export_csv(
+            rows=rows,
+            columns=columns,
+            table_name=request.table_name,
         )
-
-        return StreamingResponse(
-            io.BytesIO(csv_bytes),
-            media_type="text/csv; charset=utf-8",
-            headers={
-                "Content-Disposition":
-                f'attachment; filename="{request.table_name}.csv"'
-            },
-        )
-
-    # Excel output.
 
     if request.format == "excel":
-
-        try:
-            import pandas as pd
-            import openpyxl
-
-        except ImportError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Excel export requires "
-                    "pandas and openpyxl."
-                ),
-            ) from exc
-
-        safe_rows = [
-            {
-                column: spreadsheet_safe(row[column])
-                for column in columns
-            }
-            for row in rows
-        ]
-
-        dataframe = pd.DataFrame(
-            safe_rows,
+        return export_excel(
+            rows=rows,
             columns=columns,
-        )
-
-        output = io.BytesIO()
-
-        dataframe.to_excel(
-            output,
-            index=False,
-            engine="openpyxl",
-        )
-
-        output.seek(0)
-
-        return StreamingResponse(
-            output,
-            media_type=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            headers={
-                "Content-Disposition":
-                f'attachment; filename="{request.table_name}.xlsx"'
-            },
+            table_name=request.table_name,
         )
 
     raise HTTPException(
